@@ -1,0 +1,263 @@
+// Drop-in replacement for the scaffold's lib/race/handlers.ts: all six ASRP/1 task types built.
+// Requires the Gemini module (with the extended lib/ai/gemini.ts that adds askGeminiJson),
+// the Payments module (payUsdc, loadAgentSigner) and the Spending module (budget guard).
+import { TaskError, type Task, type TaskOutput, type TaskRequest, type TaskType, type ToolSpec } from "./protocol";
+import { callTool, searchSource, ToolCallError } from "./tools";
+import { memory } from "./memory";
+import { askGemini, askGeminiJson } from "../ai/gemini";
+import { loadAgentSigner } from "../payments/client";
+import { payUsdc, TransferError } from "../payments/transfer";
+import { readSpendingPolicy } from "../spending/policy";
+import { SpendingTracker } from "../spending/tracker";
+
+type Handler = ((task: Task, request: TaskRequest) => Promise<TaskOutput>) & { notImplemented?: boolean };
+
+// ---------- shared helpers ----------
+
+const SYSTEM = "You are a precise, terse assistant inside an automated agent. Never add preamble. Follow the output format exactly.";
+
+/** The verifier allows roughly 11 s for a tools task, so one tool call must never block that long. */
+const TOOL_TIMEOUT_MS = 6_000;
+const TOOL_RETRIES_ON_503 = 2;
+
+function inputText(task: Task): string {
+  if (typeof task.input === "string") return task.input;
+  throw new TaskError("invalid_input", "task.input must be a string for this task type.");
+}
+
+function requireString(task: Task): string {
+  const s = inputText(task).trim();
+  if (!s) throw new TaskError("invalid_input", "task.input is empty.");
+  return s;
+}
+
+/** Maps a tool failure to the protocol error the reliability layer expects. */
+function mapToolError(err: unknown): never {
+  if (err instanceof ToolCallError) {
+    if (err.httpStatus === null) {
+      if (/did not answer within/i.test(err.message)) throw new TaskError("upstream_timeout", err.message);
+      throw new TaskError("upstream_unavailable", err.message);
+    }
+    if (err.httpStatus >= 500) throw new TaskError("upstream_unavailable", err.message);
+    if (err.httpStatus === 408 || err.httpStatus === 504) throw new TaskError("upstream_timeout", err.message);
+    throw new TaskError("upstream_unavailable", err.message);
+  }
+  if (err instanceof TaskError) throw err;
+  throw new TaskError("internal", err instanceof Error ? err.message : String(err));
+}
+
+/** One tool call with a short retry on 5xx (the reliability layer sends two 503s, then succeeds). */
+async function callToolReliably(tool: ToolSpec, task: Task, input: Record<string, unknown>): Promise<unknown> {
+  const timeout = Math.min(task.limits?.timeoutMs ?? TOOL_TIMEOUT_MS, TOOL_TIMEOUT_MS);
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await callTool(tool, task, input, timeout);
+    } catch (err) {
+      const retryable = err instanceof ToolCallError && err.httpStatus !== null && err.httpStatus >= 500 && err.httpStatus !== 504;
+      if (retryable && attempt < TOOL_RETRIES_ON_503) {
+        attempt++;
+        await new Promise((r) => setTimeout(r, 250 * attempt));
+        continue;
+      }
+      mapToolError(err);
+    }
+  }
+}
+
+interface PlanStep {
+  action: "call" | "finish";
+  tool?: string;
+  input?: Record<string, unknown>;
+  data?: unknown;
+  text?: string;
+}
+
+/**
+ * Generic agent loop: Gemini decides the next tool call from the goal, the tool specs and the
+ * results so far, until it finishes. Every real tool call is recorded in toolResults.
+ */
+async function runAgentLoop(task: Task, goal: string, extraRules: string): Promise<TaskOutput> {
+  const tools = task.tools ?? [];
+  if (tools.length === 0) throw new TaskError("invalid_input", "This task has no tools to call.");
+  const maxCalls = task.limits?.maxToolCalls ?? 8;
+  const toolResults: { tool: string; result: unknown }[] = [];
+  const transcript: string[] = [];
+
+  const toolDescriptions = tools.map((t) => `- ${t.name}: ${t.description}\n  inputSchema: ${JSON.stringify(t.inputSchema)}`).join("\n");
+
+  for (let i = 0; i <= maxCalls; i++) {
+    const prompt = [
+      `GOAL:\n${goal}`,
+      `TOOLS (call by exact name, input must match inputSchema):\n${toolDescriptions}`,
+      `RESULTS SO FAR (oldest first):\n${transcript.length ? transcript.join("\n") : "(none yet)"}`,
+      `RULES:\n- Call one tool at a time. Never invent a tool result; only use RESULTS SO FAR.\n- Use at most ${maxCalls} calls in total (${toolResults.length} used).\n- When the goal is fully answered, finish.\n${extraRules}`,
+      `Reply with JSON: {"action":"call","tool":"<name>","input":{...}} or {"action":"finish","data":<result object>,"text":"<one sentence>"}.`,
+    ].join("\n\n");
+
+    let step: PlanStep;
+    try {
+      step = await askGeminiJson<PlanStep>(prompt, { system: SYSTEM });
+    } catch (err) {
+      throw new TaskError("internal", `Planner failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (step.action === "finish") {
+      return { data: step.data ?? {}, text: step.text ?? "Done.", toolResults };
+    }
+    if (step.action !== "call" || !step.tool) throw new TaskError("internal", "Planner returned an unusable step.");
+    if (toolResults.length >= maxCalls) throw new TaskError("limit_exceeded", `Tool-call limit of ${maxCalls} reached.`);
+
+    const tool = tools.find((t) => t.name === step.tool);
+    if (!tool) throw new TaskError("internal", `Planner asked for unknown tool "${step.tool}".`);
+    const input = step.input ?? {};
+    const result = await callToolReliably(tool, task, input);
+    toolResults.push({ tool: tool.name, result });
+    transcript.push(`${tool.name}(${JSON.stringify(input)}) => ${JSON.stringify(result).slice(0, 1500)}`);
+  }
+  throw new TaskError("limit_exceeded", "The agent did not finish within the tool-call limit.");
+}
+
+// ---------- payment workflow ----------
+
+let tracker: SpendingTracker | null = null;
+function getTracker(): SpendingTracker {
+  tracker ??= new SpendingTracker(readSpendingPolicy());
+  return tracker;
+}
+
+const PAY_RE = /pay\s+(\d+(?:\.\d+)?)\s*(?:devnet\s+)?usdc\s+to\s+([1-9A-HJ-NP-Za-km-z]{32,44})/i;
+const MEMO_RE = /memo\s*[:=]?\s*["“']([^"”']+)["”']/i;
+
+function parsePaymentInstruction(text: string): { amountUsdc: number; to: string; memo?: string } | null {
+  const m = text.match(PAY_RE);
+  if (!m) return null;
+  const memo = text.match(MEMO_RE)?.[1];
+  return { amountUsdc: Number(m[1]), to: m[2], memo };
+}
+
+async function runPayment(task: Task, text: string): Promise<TaskOutput> {
+  const p = parsePaymentInstruction(text)!;
+  if (task.limits?.maxSpendUsd !== undefined && p.amountUsdc > task.limits.maxSpendUsd + 1e-9) {
+    throw new TaskError("limit_exceeded", `Asked to pay ${p.amountUsdc} USDC but the task allows at most ${task.limits.maxSpendUsd}.`);
+  }
+  let signer;
+  try {
+    signer = await loadAgentSigner();
+  } catch (err) {
+    throw new TaskError("internal", err instanceof Error ? err.message : String(err));
+  }
+  try {
+    const { signature } = await payUsdc(signer, { to: p.to, amountUsdc: p.amountUsdc, memo: p.memo }, { guard: getTracker(), timeoutMs: 40_000 });
+    return {
+      data: { signature, to: p.to, amountUsdc: p.amountUsdc, memo: p.memo ?? null },
+      text: `Paid ${p.amountUsdc} devnet USDC to ${p.to}${p.memo ? ` with memo "${p.memo}"` : ""}. Signature ${signature}.`,
+    };
+  } catch (err) {
+    if (err instanceof TransferError && /spending limits/i.test(err.message)) throw new TaskError("limit_exceeded", err.message);
+    throw new TaskError("internal", err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ---------- handlers ----------
+
+export const handlers: Record<TaskType, Handler> = {
+  // First Intelligence: answer task.input with the model.
+  respond: async (task) => {
+    const q = requireString(task);
+    const text = await askGemini(
+      `${q}\n\nAnswer directly. If the question is arithmetic, reply with only the final number. If it asks you to reply with a specific word in capitals, reply with exactly that word in capitals and nothing else. Otherwise answer in one short sentence.`,
+      { system: SYSTEM },
+    );
+    const trimmed = text.trim();
+    if (!trimmed) throw new TaskError("internal", "The model returned an empty answer.");
+    return { text: trimmed };
+  },
+
+  // Structured Outputs: JSON matching task.schema.
+  extract: async (task) => {
+    if (!task.schema || typeof task.schema !== "object") throw new TaskError("invalid_input", "task.schema is required for extract.");
+    const raw = task.input;
+    const text = typeof raw === "string" ? raw.trim() : JSON.stringify(raw ?? "");
+    if (!text || text === '""' || text === "{}") throw new TaskError("invalid_input", "task.input is empty.");
+    let data: unknown;
+    try {
+      data = await askGeminiJson(`Extract the information from the text below into JSON.\n\nTEXT:\n${text}\n\nUse null for any field that is not present. Keep dates in ISO format (YYYY-MM-DD) when a full date is given, otherwise as written.`, {
+        system: SYSTEM,
+        schema: task.schema,
+      });
+    } catch (err) {
+      throw new TaskError("internal", `Extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (data === null || typeof data !== "object") throw new TaskError("internal", "Extraction did not return an object.");
+    // Make sure every top-level property in the schema exists (null when missing).
+    const props = (task.schema as { properties?: Record<string, unknown> }).properties;
+    if (props && !Array.isArray(data)) {
+      for (const key of Object.keys(props)) if (!(key in (data as Record<string, unknown>))) (data as Record<string, unknown>)[key] = null;
+    }
+    return { data };
+  },
+
+  // Tool Calling and Reliability.
+  use_tools: async (task) => {
+    const goal = requireString(task);
+    return runAgentLoop(
+      task,
+      goal,
+      "- Return data in exactly the shape the goal asks for (for example {\"totalGbp\": 123.45}); numbers as JSON numbers, money rounded to 2 decimals.\n- If a conversion rate is needed, fetch it with the tool rather than guessing.\n- If the goal names record ids, look up every one of them before finishing.",
+    );
+  },
+
+  // External Knowledge: answer from the source and cite document ids.
+  answer_from_source: async (task) => {
+    const question = requireString(task);
+    if (!task.source) throw new TaskError("invalid_input", "This task has no source.");
+    let found: unknown;
+    try {
+      found = await searchSource(task, question, Math.min(task.limits?.timeoutMs ?? TOOL_TIMEOUT_MS, TOOL_TIMEOUT_MS));
+    } catch (err) {
+      mapToolError(err);
+    }
+    const docs = JSON.stringify(found).slice(0, 12_000);
+    let out: { answer: string | null; sourceIds: string[] };
+    try {
+      out = await askGeminiJson(
+        `QUESTION:\n${question}\n\nSEARCH RESULTS (JSON from the knowledge source; each document has an id):\n${docs}\n\nAnswer the question using ONLY these documents. If they do not contain the answer, set "answer" to null and "sourceIds" to []. Otherwise give a short answer and list the ids of the documents you used.`,
+        { system: SYSTEM, schema: { type: "object", properties: { answer: { type: ["string", "null"] }, sourceIds: { type: "array", items: { type: "string" } } }, required: ["answer", "sourceIds"] } },
+      );
+    } catch (err) {
+      throw new TaskError("internal", `Answering failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const sourceIds = Array.isArray(out.sourceIds) ? out.sourceIds.map(String) : [];
+    const answer = typeof out.answer === "string" && out.answer.trim() ? out.answer.trim() : null;
+    return { text: answer ?? "The source does not contain that information.", data: { answer, sourceIds }, toolResults: [{ tool: "source", result: found }] };
+  },
+
+  // Memory and Context: per-session history only.
+  converse: async (task) => {
+    const message = requireString(task);
+    if (!task.sessionId) throw new TaskError("invalid_input", "task.sessionId is required for converse.");
+    const history = await memory.history(task.sessionId);
+    const transcript = history.map((t) => `${t.role === "user" ? "User" : "Assistant"}: ${t.text}`).join("\n");
+    const reply = (
+      await askGemini(
+        `${transcript ? `CONVERSATION SO FAR:\n${transcript}\n\n` : ""}User: ${message}\n\nReply as the assistant in one or two short sentences. Use only facts stated earlier in THIS conversation; if asked about something never mentioned here, say you don't know.`,
+        { system: SYSTEM },
+      )
+    ).trim();
+    await memory.append(task.sessionId, { role: "user", text: message }, { role: "assistant", text: reply });
+    return { text: reply };
+  },
+
+  // Autonomous Workflow: the payment stage, or a multi-step tool workflow within limits.
+  run_workflow: async (task) => {
+    const goal = requireString(task);
+    if (parsePaymentInstruction(goal)) return runPayment(task, goal);
+    const budget = task.limits?.maxSpendUsd;
+    return runAgentLoop(
+      task,
+      goal,
+      `- Follow the natural order of the tools (for example check availability, then quote, then order).\n${budget !== undefined ? `- Budget: at most ${budget} USD in total. Refuse (do not order) any item whose quoted price would exceed the remaining budget, and say so in text.` : "- Respect any budget stated in the goal."}\n- Finish with data matching the requested shape${task.schema ? `, and this JSON Schema: ${JSON.stringify(task.schema)}` : ""}.`,
+    );
+  },
+};
